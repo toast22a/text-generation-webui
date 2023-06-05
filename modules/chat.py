@@ -20,7 +20,30 @@ from modules.text_generation import (generate_reply, get_encoded_length,
 from modules.utils import replace_all
 
 
+def returns_copy(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        return copy.copy(f(*args, **kwargs))
+    return wrapper
+
+
+@functools.lru_cache(maxsize=2)
+@returns_copy
+def split_names(name_string, sep=';'):
+    return [x.strip() for x in name_string.split(sep)]
+
+
+def extract_name(name_string, index, sep=';'):
+    names = split_names(name_string, sep=sep)
+    try:
+        return names[index]
+    except IndexError:
+        return f'Character{index}'
+
+
 def get_turn_substrings(state, instruct=False):
+    bot_names = [state['name2_instruct']] if instruct else split_names(state['name2'])
+
     if instruct:
         if 'turn_template' not in state or state['turn_template'] == '':
             template = '<|user|>\n<|user-message|>\n<|bot|>\n<|bot-message|>\n'
@@ -31,8 +54,12 @@ def get_turn_substrings(state, instruct=False):
 
     replacements = {
         '<|user|>': state['name1_instruct' if instruct else 'name1'].strip(),
-        '<|bot|>': state['name2_instruct' if instruct else 'name2'].strip(),
+        '<|bot|>': bot_names[0],
     }
+    if not instruct:
+        replacements.update({
+            f'<|bot-{i}|>': v for i,v in enumerate(bot_names)
+        })
 
     output = {
         'user_turn': template.split('<|bot|>')[0],
@@ -40,6 +67,13 @@ def get_turn_substrings(state, instruct=False):
         'user_turn_stripped': template.split('<|bot|>')[0].split('<|user-message|>')[0],
         'bot_turn_stripped': '<|bot|>' + template.split('<|bot|>')[1].split('<|bot-message|>')[0],
     }
+    if not instruct:
+        output.update({
+            f'bot-{i}_turn': output['bot_turn'].replace('<|bot|>', f'<|bot-{i}|>') for i,_ in enumerate(bot_names)
+        })
+        output.update({
+            f'bot-{i}_turn_stripped': output['bot_turn_stripped'].replace('<|bot|>', f'<|bot-{i}|>') for i,_ in enumerate(bot_names)
+        })
 
     for k in output:
         output[k] = replace_all(output[k], replacements)
@@ -48,10 +82,13 @@ def get_turn_substrings(state, instruct=False):
 
 
 def generate_chat_prompt(user_input, state, **kwargs):
+    bot_names = split_names(state['name2'])
+
     impersonate = kwargs.get('impersonate', False)
     _continue = kwargs.get('_continue', False)
     also_return_rows = kwargs.get('also_return_rows', False)
     history = kwargs.get('history', shared.history)['internal']
+    bot_indices = kwargs.get('history', shared.history)['bot_indices']
     is_instruct = state['mode'] == 'instruct'
 
     # Find the maximum prompt size
@@ -64,20 +101,21 @@ def generate_chat_prompt(user_input, state, **kwargs):
         'chat': get_turn_substrings(state, instruct=False),
         'instruct': get_turn_substrings(state, instruct=True)
     }
+    print(f'all_substrings<<<{all_substrings}>>>')
 
     substrings = all_substrings['instruct' if is_instruct else 'chat']
 
     # Create the template for "chat-instruct" mode
     if state['mode'] == 'chat-instruct':
         wrapper = ''
-        command = state['chat-instruct_command'].replace('<|character|>', state['name2'] if not impersonate else state['name1'])
+        command = state['chat-instruct_command'].replace('<|character|>', bot_names[0] if not impersonate else state['name1'])
         wrapper += state['context_instruct']
         wrapper += all_substrings['instruct']['user_turn'].replace('<|user-message|>', command)
         wrapper += all_substrings['instruct']['bot_turn_stripped']
         if impersonate:
             wrapper += substrings['user_turn_stripped'].rstrip(' ')
         elif _continue:
-            wrapper += apply_extensions("bot_prefix", substrings['bot_turn_stripped'])
+            wrapper += apply_extensions("bot_prefix", substrings[f'bot-{bot_indices[-1]}_turn_stripped'])
             wrapper += history[-1][1]
         else:
             wrapper += apply_extensions("bot_prefix", substrings['bot_turn_stripped'].rstrip(' '))
@@ -91,9 +129,15 @@ def generate_chat_prompt(user_input, state, **kwargs):
     while i >= 0 and get_encoded_length(wrapper.replace('<|prompt|>', ''.join(rows))) < max_length:
         if _continue and i == len(history) - 1:
             if state['mode'] != 'chat-instruct':
-                rows.insert(1, substrings['bot_turn_stripped'] + history[i][1].strip())
+                if is_instruct:
+                    rows.insert(1, substrings['bot_turn_stripped'] + history[i][1].strip())
+                else:
+                    rows.insert(1, substrings[f'bot-{bot_indices[i]}_turn_stripped'] + history[i][1].strip())
         else:
-            rows.insert(1, substrings['bot_turn'].replace('<|bot-message|>', history[i][1].strip()))
+            if is_instruct:
+                rows.insert(1, substrings['bot_turn'].replace('<|bot-message|>', history[i][1].strip()))
+            else:
+                rows.insert(1, substrings[f'bot-{bot_indices[i]}_turn'].replace('<|bot-message|>', history[i][1].strip()))
 
         string = history[i][0]
         if string not in ['', '<|BEGIN-VISIBLE-CHAT|>']:
@@ -129,26 +173,34 @@ def generate_chat_prompt(user_input, state, **kwargs):
 def get_stopping_strings(state):
     stopping_strings = []
     if state['mode'] in ['instruct', 'chat-instruct']:
+        bot_names = [state['name2_instruct']]
+
         stopping_strings += [
             state['turn_template'].split('<|user-message|>')[1].split('<|bot|>')[0] + '<|bot|>',
             state['turn_template'].split('<|bot-message|>')[1] + '<|user|>'
         ]
+        stopping_strings += [
+            stopping_strings[0].replace('<|bot|>', f'<|bot-{i}|>') for i,_ in enumerate(bot_names)
+        ]
 
         replacements = {
             '<|user|>': state['name1_instruct'],
-            '<|bot|>': state['name2_instruct']
+            '<|bot|>': bot_names[0]
         }
+        replacements.update({
+            f'<|bot-{i}|>': v for i,v in enumerate(bot_names)
+        })
 
         for i in range(len(stopping_strings)):
             stopping_strings[i] = replace_all(stopping_strings[i], replacements).rstrip(' ').replace(r'\n', '\n')
 
     if state['mode'] in ['chat', 'chat-instruct']:
-        stopping_strings += [
-            f"\n{state['name1']}:",
-            f"\n{state['name2']}:"
-        ]
+        bot_names = split_names(state['name2'])
+        stopping_strings += [f"\n{state['name1']}:"]
+        stopping_strings += [f"\n{x}:" for x in bot_names]
 
     stopping_strings += ast.literal_eval(f"[{state['custom_stopping_strings']}]")
+    print(f'stopping_strings<<<{stopping_strings}>>>')
     return stopping_strings
 
 
@@ -207,19 +259,20 @@ def chatbot_wrapper(text, history, state, regenerate=False, _continue=False, loa
         text = apply_extensions('input', text)
         # *Is typing...*
         if loading_message:
-            yield {'visible': output['visible'] + [[visible_text, shared.processing_message]], 'internal': output['internal']}
+            yield {'visible': output['visible'] + [[visible_text, shared.processing_message]], 'internal': output['internal'], 'bot_indices': output['bot_indices']}
     else:
         text, visible_text = output['internal'][-1][0], output['visible'][-1][0]
         if regenerate:
             output['visible'].pop()
             output['internal'].pop()
+            output['bot_indices'].pop()
             # *Is typing...*
             if loading_message:
-                yield {'visible': output['visible'] + [[visible_text, shared.processing_message]], 'internal': output['internal']}
+                yield {'visible': output['visible'] + [[visible_text, shared.processing_message]], 'internal': output['internal'], 'bot_indices': output['bot_indices']}
         elif _continue:
             last_reply = [output['internal'][-1][1], output['visible'][-1][1]]
             if loading_message:
-                yield {'visible': output['visible'][:-1] + [[visible_text, last_reply[1] + '...']], 'internal': output['internal']}
+                yield {'visible': output['visible'][:-1] + [[visible_text, last_reply[1] + '...']], 'internal': output['internal'], 'bot_indices': output['bot_indices']}
 
     # Generating the prompt
     kwargs = {
@@ -230,6 +283,7 @@ def chatbot_wrapper(text, history, state, regenerate=False, _continue=False, loa
     prompt = apply_extensions('custom_generate_chat_prompt', text, state, **kwargs)
     if prompt is None:
         prompt = generate_chat_prompt(text, state, **kwargs)
+    print(f'prompt<<<{prompt}>>>')
 
     # Generate
     cumulative_reply = ''
@@ -254,6 +308,7 @@ def chatbot_wrapper(text, history, state, regenerate=False, _continue=False, loa
                 if not _continue:
                     output['internal'].append(['', ''])
                     output['visible'].append(['', ''])
+                    output['bot_indices'].append(0)
 
             if _continue:
                 output['internal'][-1] = [text, last_reply[0] + reply]
@@ -333,13 +388,14 @@ def generate_chat_reply_wrapper(text, start_with, state, regenerate=False, _cont
         if i != 0:
             shared.history = copy.deepcopy(history)
 
-        yield chat_html_wrapper(history['visible'], state['name1'], state['name2'], state['mode'], state['chat_style'])
+        yield chat_html_wrapper(history['visible'], state['name1'], split_names(state['name2']), state['mode'], state['chat_style'], bot_indices=history['bot_indices'])
 
 
 def remove_last_message():
     if len(shared.history['visible']) > 0 and shared.history['internal'][-1][0] != '<|BEGIN-VISIBLE-CHAT|>':
         last = shared.history['visible'].pop()
         shared.history['internal'].pop()
+        shared.history['bot_indices'].pop()
     else:
         last = ['', '']
 
@@ -357,36 +413,42 @@ def replace_last_reply(text):
     if len(shared.history['visible']) > 0:
         shared.history['visible'][-1][1] = text
         shared.history['internal'][-1][1] = apply_extensions("input", text)
+        shared.history['bot_indices'][-1] = 0
 
 
 def send_dummy_message(text):
     shared.history['visible'].append([text, ''])
     shared.history['internal'].append([apply_extensions("input", text), ''])
+    shared.history['bot_indices'].append(0)
 
 
 def send_dummy_reply(text):
     if len(shared.history['visible']) > 0 and not shared.history['visible'][-1][1] == '':
         shared.history['visible'].append(['', ''])
         shared.history['internal'].append(['', ''])
+        shared.history['bot_indices'].append(0)
 
     shared.history['visible'][-1][1] = text
     shared.history['internal'][-1][1] = apply_extensions("input", text)
+    shared.history['bot_indices'][-1] = 0
 
 
 def clear_chat_log(greeting, mode):
     shared.history['visible'] = []
     shared.history['internal'] = []
+    shared.history['bot_indices'] = []
 
     if mode != 'instruct':
         if greeting != '':
             shared.history['internal'] += [['<|BEGIN-VISIBLE-CHAT|>', greeting]]
             shared.history['visible'] += [['', apply_extensions("output", greeting)]]
+            shared.history['bot_indices'] += [0]
 
         save_history(mode)
 
 
 def redraw_html(name1, name2, mode, style, reset_cache=False):
-    return chat_html_wrapper(shared.history['visible'], name1, name2, mode, style, reset_cache=reset_cache)
+    return chat_html_wrapper(shared.history['visible'], name1, split_names(name2), mode, style, reset_cache=reset_cache, bot_indices=shared.history['bot_indices'])
 
 
 def tokenize_dialogue(dialogue, name1, name2):
@@ -446,7 +508,7 @@ def save_history(mode, timestamp=False):
         Path('logs').mkdir()
 
     with open(Path(f'logs/{fname}'), 'w', encoding='utf-8') as f:
-        f.write(json.dumps({'data': shared.history['internal'], 'data_visible': shared.history['visible']}, indent=2))
+        f.write(json.dumps({'data': shared.history['internal'], 'data_visible': shared.history['visible'], 'data_bot_indices': shared.history['bot_indices']}, indent=2))
 
     return Path(f'logs/{fname}')
 
@@ -461,12 +523,18 @@ def load_history(file, name1, name2):
                 shared.history['visible'] = j['data_visible']
             else:
                 shared.history['visible'] = copy.deepcopy(shared.history['internal'])
+            if 'bot_indices' in j:
+                shared.history['bot_indices'] = j['data_bot_indices']
+            else:
+                shared.history['bot_indices'] = [0]*len(shared.history['internal'])
     except:
         shared.history['internal'] = tokenize_dialogue(file, name1, name2)
         shared.history['visible'] = copy.deepcopy(shared.history['internal'])
+        shared.history['bot_indices'] = [0]*len(shared.history['internal'])
 
 
 def replace_character_names(text, name1, name2):
+    name2 = extract_name(name2, 0)
     text = text.replace('{{user}}', name1).replace('{{char}}', name2)
     return text.replace('<USER>', name1).replace('<BOT>', name2)
 
@@ -560,6 +628,7 @@ def load_character(character, name1, name2, instruct=False):
     if not instruct:
         shared.history['internal'] = []
         shared.history['visible'] = []
+        shared.history['bot_indices'] = []
         if Path(f'logs/{shared.character}_persistent.json').exists():
             load_history(open(Path(f'logs/{shared.character}_persistent.json'), 'rb').read(), name1, name2)
         else:
@@ -567,6 +636,7 @@ def load_character(character, name1, name2, instruct=False):
             if greeting != "":
                 shared.history['internal'] += [['<|BEGIN-VISIBLE-CHAT|>', greeting]]
                 shared.history['visible'] += [['', apply_extensions("output", greeting)]]
+                shared.history['bot_indices'] += [0]
 
             # Create .json log files since they don't already exist
             save_history('instruct' if instruct else 'chat')

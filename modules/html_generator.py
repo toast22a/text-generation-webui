@@ -4,6 +4,7 @@ This is a library for formatting text outputs as nice HTML.
 
 '''
 
+import itertools
 import os
 import re
 import time
@@ -188,14 +189,17 @@ def generate_instruct_html(history):
     return output
 
 
-def generate_cai_chat_html(history, name1, name2, style, reset_cache=False):
+def generate_cai_chat_html(history, name1, name2, style, reset_cache=False, bot_indices=None):
+    bot_names = name2
+    bot_indices = bot_indices[::-1] if bot_indices is not None else itertools.repeat(0)
+
     output = f'<style>{chat_styles[style]}</style><div class="chat" id="chat">'
 
     # We use ?name2 and ?time.time() to force the browser to reset caches
-    img_bot = f'<img src="file/cache/pfp_character.png?{name2}">' if Path("cache/pfp_character.png").exists() else ''
+    img_bot = f'<img src="file/cache/pfp_character.png?{bot_names[0]}">' if Path("cache/pfp_character.png").exists() else ''
     img_me = f'<img src="file/cache/pfp_me.png?{time.time() if reset_cache else ""}">' if Path("cache/pfp_me.png").exists() else ''
 
-    for i, _row in enumerate(history[::-1]):
+    for i, (_row, bot_history_index) in enumerate(zip(history[::-1], bot_indices)):
         row = [convert_to_markdown(entry) for entry in _row]
 
         output += f"""
@@ -205,7 +209,7 @@ def generate_cai_chat_html(history, name1, name2, style, reset_cache=False):
                 </div>
                 <div class="text">
                   <div class="username">
-                    {name2}
+                    {bot_names[bot_history_index]}
                   </div>
                   <div class="message-body">
                     {row[1]}
@@ -237,10 +241,13 @@ def generate_cai_chat_html(history, name1, name2, style, reset_cache=False):
     return output
 
 
-def generate_chat_html(history, name1, name2, reset_cache=False):
+def generate_chat_html(history, name1, name2, reset_cache=False, bot_indices=None):
+    bot_names = name2
+    bot_indices = bot_indices[::-1] if bot_indices is not None else itertools.repeat(0)
+
     output = f'<style>{chat_styles["wpp"]}</style><div class="chat" id="chat">'
 
-    for i, _row in enumerate(history[::-1]):
+    for i, (_row, bot_history_index) in enumerate(zip(history[::-1], bot_indices)):
         row = [convert_to_markdown(entry) for entry in _row]
 
         output += f"""
@@ -270,10 +277,10 @@ def generate_chat_html(history, name1, name2, reset_cache=False):
     return output
 
 
-def chat_html_wrapper(history, name1, name2, mode, style, reset_cache=False):
+def chat_html_wrapper(history, name1, name2, mode, style, reset_cache=False, bot_indices=None):
     if mode == 'instruct':
         return generate_instruct_html(history)
     elif style == 'wpp':
-        return generate_chat_html(history, name1, name2)
+        return generate_chat_html(history, name1, name2, bot_indices=bot_indices)
     else:
-        return generate_cai_chat_html(history, name1, name2, style, reset_cache)
+        return generate_cai_chat_html(history, name1, name2, style, reset_cache, bot_indices=bot_indices)

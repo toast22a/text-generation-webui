@@ -16,7 +16,7 @@ soft_prompt_tensor = None
 soft_prompt = False
 
 # Chat variables
-history = {'internal': [], 'visible': []}
+history = {'internal': [], 'visible': [], 'bot_indices': []}
 character = 'None'
 stop_everything = False
 processing_message = '*Is typing...*'
